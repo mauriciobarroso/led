@@ -92,6 +92,7 @@ esp_err_t led_init(led_t * const me, gpio_num_t gpio, led_mode_e mode, uint32_t 
   *
   * @retval
   * 	- ESP_OK on success
+  * 	- ESP_FAIL if the maximum number of LEDs were instantiated
   * 	- ESP_ERR_INVALID_ARG if the argument is invalid
   */
 esp_err_t led_start(led_t * const me);
