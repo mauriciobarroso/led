@@ -36,352 +36,263 @@
 /* Includes ------------------------------------------------------------------*/
 #include "led.h"
 #include "esp_log.h"
+#include "freertos/queue.h"
 
 /* External variables --------------------------------------------------------*/
 
 /* Private typedef -----------------------------------------------------------*/
 
-/* Private define ------------------------------------------------------------*/
-#define LED_MAX_NUM		(8)
-#define LED_TIMER_FREQ	(5000)
-#define LED_TIMER		LEDC_TIMER_1
-#define LED_SPEED_MODE	LEDC_LOW_SPEED_MODE
-
 /* Private macro -------------------------------------------------------------*/
+#if CONFIG_IDF_TARGET_ESP32
+#define LED_SPEED_MODE	LEDC_HIGH_SPEED_MODE
+#endif
+
+#if !CONFIG_IDF_TARGET_ESP32
+#define LED_SPEED_MODE	LEDC_LOW_SPEED_MODE
+#endif
+
+#define LED_MAX_NUM			SOC_LEDC_CHANNEL_NUM
+#define LED_TIMER_FREQ	CONFIG_LED_TIMER_FREQ
+#define LED_TIMER_NUM		CONFIG_LED_TIMER_NUM
 
 /* Private function prototypes -----------------------------------------------*/
-static bool IRAM_ATTR fade_end_cb(const ledc_cb_param_t * param, void * arg);
+static bool fade_end_cb(const ledc_cb_param_t * param, void * arg);
+static void led_control_task(void * arg);
 
 /* Private variables ---------------------------------------------------------*/
 static const char * TAG = "led";
-
-static bool is_installed = false;
-static uint8_t leds_num = 0;
+static uint8_t led_num = 0;
+static TaskHandle_t led_control_handle = NULL;
+static QueueHandle_t led_control_queue = NULL;
 
 /* Exported functions --------------------------------------------------------*/
-esp_err_t led_init(led_t * const me, gpio_num_t gpio, led_mode_e mode, uint32_t time, uint8_t intensity) {
+esp_err_t led_init(led_t * const me, gpio_num_t gpio) {
 	ESP_LOGI(TAG, "Initializing led component...");
 
 	/* Error code variable */
 	esp_err_t ret;
 
-	/* Check if the maximum number of LEDs was initialized */
-	if(leds_num >= LED_MAX_NUM) {
+	/* Check if the maximum number of LEDs was reached */
+	if(led_num >= LED_MAX_NUM) {
 		ESP_LOGE(TAG, "Maximum number of LEDS reached");
 
 		return ESP_FAIL;
+	}
+
+	/* Configure and initialize timer for the first instance */
+	if(!led_num) {
+		ledc_timer_config_t leds_timer = {
+				.duty_resolution = LEDC_TIMER_13_BIT,
+				.freq_hz = LED_TIMER_FREQ,
+				.speed_mode = LED_SPEED_MODE,
+				.timer_num = LED_TIMER_NUM,
+				.clk_cfg = LEDC_AUTO_CLK,
+		};
+
+		ret = ledc_timer_config(&leds_timer);
+
+		if(ret != ESP_OK) {
+			ESP_LOGE(TAG, "Failed to configure timer");
+
+			return ret;
+		}
 	}
 
 	/* Allocate memory for led instance */
 	me->ledc_config = malloc(sizeof(ledc_channel_config_t));
 
 	if(me->ledc_config == NULL) {
-		ESP_LOGE(TAG, "Error allocating memory for LEDC configuration");
+		ESP_LOGE(TAG, "Error to allocate memory for LEDC configuration");
 
 		return ESP_ERR_NO_MEM;
 	}
 
 	/* Fill data structure */
-	me->ledc_config->channel = leds_num;
-	me->ledc_config->flags.output_invert = 0;
-	me->ledc_config->hpoint = 0;
-
-	if(intensity > 100) {
-		ESP_LOGE(TAG, "Error in intensity argument");
-
-		return ESP_ERR_INVALID_ARG;
-	}
-
-	me->ledc_config->duty = intensity * 80;	/* todo: define in macros */
-
-	if(gpio < GPIO_NUM_0 || gpio >= GPIO_NUM_MAX) {
-		ESP_LOGE(TAG, "Error in gpio number argument");
-
-		return ESP_ERR_INVALID_ARG;
-	}
-
+	me->ledc_config->channel = led_num;
+	me->ledc_config->duty = 0;
 	me->ledc_config->gpio_num = gpio;
-
-	if(me->mode == CONTINUOUS_MODE) {
-		me->ledc_config->intr_type = LEDC_INTR_DISABLE;
-	}
-	else {
-		me->ledc_config->intr_type = LEDC_INTR_FADE_END;
-	}
-
 	me->ledc_config->speed_mode = LED_SPEED_MODE;
-	me->ledc_config->timer_sel = LED_TIMER;
-	me->mode = mode;
-	me->time = time;
-	me->state = 0;
-
-	/* Configure and initialize timer */
-	if(!leds_num) {
-		ledc_timer_config_t leds_timer = {
-				.duty_resolution = LEDC_TIMER_13_BIT,
-				.freq_hz = LED_TIMER_FREQ,
-				.speed_mode = LED_SPEED_MODE,
-				.timer_num = LED_TIMER,
-				.clk_cfg = LEDC_AUTO_CLK,
-		};
-
-		ledc_timer_config(&leds_timer);
-	}
+	me->ledc_config->hpoint = 0;
+	me->ledc_config->timer_sel = LED_TIMER_NUM;
+	me->ledc_config->flags.output_invert = 0;
+	me->ledc_config->intr_type = LEDC_INTR_DISABLE;
 
 	/* Set LED controller with its configuration */
-	ret = ledc_channel_config(me->ledc_config);
+	ledc_channel_config(me->ledc_config);
 
-	if(ret != ESP_OK) {
-		return ret;
-	}
-
-	/* Turn off LED */
-	ledc_stop(me->ledc_config->speed_mode, me->ledc_config->channel, 0);
-
-	/* Install fade functionality service */
-	if(me->ledc_config->intr_type == LEDC_INTR_FADE_END && !is_installed) {
+	/* Install fade functionality for the first instance */
+	if(!led_num) {
 		ret = ledc_fade_func_install(0);
 
-		if(ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-			ESP_LOGE(TAG, "Error configuring fade functionality service");
-
+		if(ret != ESP_OK) {
 			return ret;
 		}
-
-		is_installed = true;
-	}
-
-	/**/
-	if(me->ledc_config->intr_type == LEDC_INTR_FADE_END && is_installed) {
-		ledc_cbs_t callback = {
-				.fade_cb = fade_end_cb
-		};
-
-		ESP_ERROR_CHECK(ledc_cb_register(me->ledc_config->speed_mode,
-				me->ledc_config->channel,
-				&callback,
-				(void *)me));
-	}
-
-    /* Increment the LEDs counter */
-	leds_num++;
-
-	/* Return error code */
-	return ret;
-}
-
-esp_err_t led_start(led_t * const me) {
-	/* Error code variable */
-	esp_err_t ret;
-
-	switch(me->mode) {
-		case FADE_MODE: {
-		    ret = ledc_set_fade_with_time(me->ledc_config->speed_mode,
-		    		me->ledc_config->channel,
-					me->ledc_config->duty,
-					me->time);
-
-		    if(ret != ESP_OK) {
-		    	ESP_LOGE(TAG, "Error configuring fade mode");
-
-		    	return ret;
-		    }
-
-		    ret = ledc_fade_start(me->ledc_config->speed_mode,
-		    		me->ledc_config->channel,
-		    		LEDC_FADE_NO_WAIT);
-
-		    if(ret != ESP_OK) {
-		    	ESP_LOGE(TAG, "Error starting fade mode");
-
-		    	return ret;
-		    }
-
-			break;
-		}
-
-		case CONTINUOUS_MODE: {
-			ret = ledc_set_duty(me->ledc_config->speed_mode,
-					me->ledc_config->channel,
-					me->ledc_config->duty);
-
-		    if(ret != ESP_OK) {
-		    	ESP_LOGE(TAG, "Error configuring continuos mode");
-
-		    	return ret;
-		    }
-
-			ret = ledc_update_duty(me->ledc_config->speed_mode,
-					me->ledc_config->channel);
-
-		    if(ret != ESP_OK) {
-		    	ESP_LOGE(TAG, "Error starting continuos mode");
-
-		    	return ret;
-		    }
-
-			break;
-		}
-
-		default:
-			ESP_LOGE(TAG, "Error in mode argument");
-			ret = ESP_ERR_INVALID_ARG;
-
-			break;
-	}
-
-	/* Return error code */
-	return ret;
-}
-
-esp_err_t led_stop(led_t * const me) {
-	/* Error code variable */
-	esp_err_t ret;
-
-	ret = ledc_set_duty(me->ledc_config->speed_mode,
-			me->ledc_config->channel,
-			0);
-
-    if(ret != ESP_OK) {
-    	ESP_LOGE(TAG, "Error setting LEDC duty cycle");
-
-    	return ret;
-    }
-
-	ret = ledc_update_duty(me->ledc_config->speed_mode,
-			me->ledc_config->channel);
-
-    if(ret != ESP_OK) {
-    	ESP_LOGE(TAG, "Error updating LEDC duty cycle");
-
-    	return ret;
-    }
-
-	ret = ledc_stop(me->ledc_config->speed_mode,
-			me->ledc_config->channel,
-			0);
-
-    if(ret != ESP_OK) {
-    	ESP_LOGE(TAG, "Error stopping LEDC duty cycle");
-
-    	return ret;
-    }
-
-	/* Return error code */
-	return ret;
-}
-
-esp_err_t led_set(led_t * const me, gpio_num_t gpio, led_mode_e mode, uint32_t time, uint8_t intensity) {
-	/* Error code variable */
-	esp_err_t ret;
-
-	/* Overwrite data structure */
-	if(gpio < GPIO_NUM_0 || gpio >= GPIO_NUM_MAX) {
-		ESP_LOGE(TAG, "Error in gpio number argument");
-
-		return ESP_ERR_INVALID_ARG;
-	}
-
-	me->ledc_config->gpio_num = gpio;
-
-	if(intensity > 100) {
-		ESP_LOGE(TAG, "Error in intensity argument");
-
-		return ESP_ERR_INVALID_ARG;
-	}
-
-	me->ledc_config->duty = intensity * 80;
-
-	if(mode != FADE_MODE && mode != CONTINUOUS_MODE) {
-		ESP_LOGE(TAG, "Error in mode argument");
-
-		return ESP_ERR_INVALID_ARG;
-	}
-
-	me->mode = mode;
-
-	if(me->mode == CONTINUOUS_MODE) {
-		me->ledc_config->intr_type = LEDC_INTR_DISABLE;
-	}
-	else {
-		me->ledc_config->intr_type = LEDC_INTR_FADE_END;
-	}
-
-	me->time = time;
-
-	/* Turn off LED */
-	ret = ledc_stop(me->ledc_config->speed_mode, me->ledc_config->channel, 0);
-
-    if(ret != ESP_OK) {
-    	ESP_LOGE(TAG, "Error stopping LEDC duty cycle");
-
-    	return ret;
-    }
-
-	/* Install fade functionality service */
-	if(me->ledc_config->intr_type == LEDC_INTR_FADE_END && !is_installed) {
-		ret = ledc_fade_func_install(0);
-
-	    if(ret != ESP_OK) {
-	    	ESP_LOGE(TAG, "Error installing fade function");
-
-	    	return ret;
-	    }
-
-		is_installed = true;
 	}
 
 	/* Register fade callback */
-	if(me->ledc_config->intr_type == LEDC_INTR_FADE_END && is_installed) {
-		ledc_cbs_t callback = {
-				.fade_cb = fade_end_cb
-		};
+	ledc_cbs_t callback = {
+			.fade_cb = fade_end_cb
+	};
 
-		ledc_cb_register(me->ledc_config->speed_mode,
-				me->ledc_config->channel,
-				&callback,
-				(void *)me);
+	ledc_cb_register(me->ledc_config->speed_mode,
+			me->ledc_config->channel,
+			&callback,
+			(void *)me);
 
-	    if(ret != ESP_OK) {
-	    	ESP_LOGE(TAG, "Error registering fade callack function");
+	/* Initialize other variables */
+	me->time = 0;
+	me->state = 0;
+	me->mode = CONTINUOUS_MODE;
 
-	    	return ret;
-	    }
+	/* Increment the LED counter */
+	led_num++;
+
+	/* Create queue to send data to control LEDs */
+	if(led_control_queue == NULL) {
+		led_control_queue = xQueueCreate(LED_MAX_NUM * 2, sizeof(led_t *));
+
+		if(led_control_queue == NULL) {
+			ESP_LOGE(TAG, "Failed to create queue");
+
+			return ESP_FAIL;
+		}
 	}
 
-	/* Start LED operation */
-	ret = led_start(me);
+	/* Create task to control LEDs */
+	if(led_control_handle == NULL) {
+		xTaskCreate(led_control_task,
+				"LED control task",
+				configMINIMAL_STACK_SIZE * 4,
+				NULL,
+				tskIDLE_PRIORITY + 1,
+				&led_control_handle);
 
-    if(ret != ESP_OK) {
-    	ESP_LOGE(TAG, "Error starting LED");
+		if(led_control_handle == NULL) {
+			ESP_LOGE(TAG, "Failed to create task");
 
-    	return ret;
-    }
+			return ESP_FAIL;
+		}
+	}
 
-	/* Return error code */
-	return ret;
+	/* Return ESP_OK if successful */
+	return ESP_OK;
+}
+
+esp_err_t led_set_continuous(led_t * const me, uint8_t intensity) {
+	/* Set mode */
+	me->mode = CONTINUOUS_MODE;
+
+	/* Set duty value according the new intensity value*/
+	if(intensity > 100) {
+		ESP_LOGE(TAG, "Error in intensity argument");
+
+		return ESP_ERR_INVALID_ARG;
+	}
+
+	me->ledc_config->duty = intensity * 81;
+
+	/* Send to queue */
+	if(xQueueSend(led_control_queue, &me, 0) != pdPASS) {
+		ESP_LOGE(TAG, "Failed to send to queue");
+
+		return ESP_FAIL;
+	}
+
+	return ESP_OK;
+}
+esp_err_t led_set_fade(led_t * const me, uint8_t intensity, uint32_t time) {
+	/* Set mode */
+	me->mode = FADE_MODE;
+
+	/* Set duty value according the new intensity value*/
+	if(intensity > 100) {
+		ESP_LOGE(TAG, "Error in intensity argument");
+
+		return ESP_ERR_INVALID_ARG;
+	}
+
+	me->ledc_config->duty = intensity * 81;
+
+	/* Set new time value */
+	me->time = time;
+
+	/* Send to queue */
+	if(xQueueSend(led_control_queue, &me, 0) != pdPASS) {
+		ESP_LOGE(TAG, "Failed to send to queue");
+
+		return ESP_FAIL;
+	}
+
+	return ESP_OK;
 }
 
 /* Private functions ---------------------------------------------------------*/
-static bool IRAM_ATTR fade_end_cb(const ledc_cb_param_t * param, void * arg) {
+static bool fade_end_cb(const ledc_cb_param_t * param, void * arg) {
     portBASE_TYPE task_awoken = pdFALSE;
 
-    led_t * led = (led_t *)arg;
-
-    /* Set and start LED functionality */
-    ledc_set_fade_with_time(led->ledc_config->speed_mode,
-    				led->ledc_config->channel,
-					led->state? 0 : led->ledc_config->duty,
-					led->time);
-
-    ledc_fade_start(led->ledc_config->speed_mode,
-    		led->ledc_config->channel,
-    		LEDC_FADE_NO_WAIT);
-
-    /* Toggle LED state */
-    led->state = !led->state;
+    if(param->event == LEDC_FADE_END_EVT) {
+    	xQueueSendFromISR(led_control_queue, &arg, 0);
+    }
 
     return (task_awoken == pdTRUE);
+}
+
+static void led_control_task(void * arg) {
+	/* Declare led instance pointer */
+	led_t * led;
+
+	/* Inifinite loop */
+	for(;;) {
+		/* Try to read the queue */
+		if(xQueueReceive(led_control_queue, &led, portMAX_DELAY) == pdPASS) {
+			/* Set the functionality according the LED mode */
+			switch(led->mode) {
+				case CONTINUOUS_MODE:
+					/* Set and update duty */
+					if(ledc_set_duty(led->ledc_config->speed_mode,
+							led->ledc_config->channel,
+							led->ledc_config->duty) == ESP_OK) {
+
+						ledc_update_duty(led->ledc_config->speed_mode,
+							led->ledc_config->channel);
+					}
+					else {
+						ESP_LOGE(TAG, "Failed to set duty");
+					}
+
+					break;
+
+				case BLINK_MODE:
+					/* todo: implement */
+					break;
+
+				case FADE_MODE:
+					/* Toggle LED state */
+					led->state = !led->state;
+
+					/* Set and start fade functionality */
+					if(ledc_set_fade_with_time(led->ledc_config->speed_mode,
+							led->ledc_config->channel,
+							led->state? 0 : led->ledc_config->duty,
+							led->time) == ESP_OK) {
+
+						ledc_fade_start(led->ledc_config->speed_mode,
+								led->ledc_config->channel,
+								LEDC_FADE_NO_WAIT);
+					}
+					else {
+						ESP_LOGE(TAG, "Failed to set fade");
+					}
+
+					break;
+
+				default:
+					ESP_LOGW(TAG, "Unknown LED mode");
+
+					break;
+			}
+		}
+	}
 }
 
 /***************************** END OF FILE ************************************/

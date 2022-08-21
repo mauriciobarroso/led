@@ -52,16 +52,16 @@ extern "C" {
 
 /* Exported types ------------------------------------------------------------*/
 typedef enum {
-	FADE_MODE,	/*!< Fade light intensity operating mode */
-	CONTINUOUS_MODE	/*!< Continuos light intensity operating mode */
-	/* Add more effects here */
+	CONTINUOUS_MODE = 0,
+	BLINK_MODE,
+	FADE_MODE
 } led_mode_e;
 
 typedef struct {
 	ledc_channel_config_t * ledc_config;	/*!< LEDC channel configuration */
-	led_mode_e mode;						/*!< LED operating mode */
-	uint32_t time;							/*!< LED operating mode time */
-	bool state;								/*!< LED current state */
+	uint32_t time;												/*!< LED operating mode time */
+	bool state;														/*!< LED current state */
+	led_mode_e mode;											/*!< LED working mode */
 } led_t;
 
 /* Exported constants --------------------------------------------------------*/
@@ -74,47 +74,19 @@ typedef struct {
   *
   * @param me Pointer to led_t structure
   * @param gpio GPIO number to attach LED
-  * @param mode LED operating mode. Can be FADE_MODE or CONTINUOS_MODE
-  * @param time LED Operating mode time
-  * @param intensity LED initial light intensity. Must be a value between 0 and
-  * 100.
   *
   * @retval
   * 	- ESP_OK on success
   * 	- ESP_FAIL if the maximum number of LEDs were instantiated
   * 	- ESP_ERR_INVALID_ARG if the argument is invalid
+  * 	- ESP_ERR_NO_MEM if there is no memory to allocate
   */
-esp_err_t led_init(led_t * const me, gpio_num_t gpio, led_mode_e mode, uint32_t time, uint8_t intensity);
+esp_err_t led_init(led_t * const me, gpio_num_t gpio);
 
 /**
-  * @brief Start LED instance
+  * @brief Set LED instance mode to continuous
   *
   * @param me Pointer to led_t structure
-  *
-  * @retval
-  * 	- ESP_OK on success
-  * 	- ESP_ERR_INVALID_ARG if the argument is invalid
-  */
-esp_err_t led_start(led_t * const me);
-
-/**
-  * @brief Stop LED instance
-  *
-  * @param me Pointer to led_t structure
-  *
-  * @retval
-  * 	- ESP_OK on success
-  * 	- ESP_ERR_INVALID_ARG if the argument is invalid
-  */
-esp_err_t led_stop(led_t * const me);
-
-/**
-  * @brief Set LED instance configuration
-  *
-  * @param me Pointer to led_t structure
-  * @param gpio GPIO number to attach LED
-  * @param mode LED operating mode. Can be FADE_MODE or CONTINUOS_MODE
-  * @param time LED Operating mode time
   * @param intensity LED initial light intensity. Must be a value between 0 and
   * 100.
   *
@@ -122,7 +94,21 @@ esp_err_t led_stop(led_t * const me);
   * 	- ESP_OK on success
   * 	- ESP_ERR_INVALID_ARG if the argument is invalid
   */
-esp_err_t led_set(led_t * const me, gpio_num_t gpio, led_mode_e mode, uint32_t time, uint8_t intensity);
+esp_err_t led_set_continuous(led_t * const me, uint8_t intensity);
+
+/**
+  * @brief Set LED instance mode to fade
+  *
+  * @param me Pointer to led_t structure
+  * @param intensity LED initial intensity. Must be a value between 0 and
+  * 100
+  * @param time Time in milliseconds to change the LED state between on and off
+  *
+  * @retval
+  * 	- ESP_OK on success
+  * 	- ESP_ERR_INVALID_ARG if the argument is invalid
+  */
+esp_err_t led_set_fade(led_t * const me, uint8_t intensity, uint32_t time);
 
 #ifdef __cplusplus
 }
