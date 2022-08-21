@@ -1,3 +1,34 @@
 menu "LED Configuration"
-
+	config LED_TIMER_FREQ
+		int "Timer frequency"
+		default 5000
+		help
+			Timer frequency in Hz
+			
+	choice LED_TIMER_NUM
+		bool "LED timer number"
+		default LED_TIMER_NUM_0
+		help
+			LED timer number to configure LEDC peripheral
+			
+		config LED_TIMER_NUM_0
+			bool "0"
+			
+		config LED_TIMER_NUM_1
+			bool "1"
+			
+		config LED_TIMER_NUM_2
+			bool "2"
+			
+		config LED_TIMER_NUM_3
+			bool "3"
+		
+	endchoice
+	
+	config LED_TIMER_NUM
+		int
+		default 0 if LED_TIMER_NUM_0
+		default 1 if LED_TIMER_NUM_1
+		default 2 if LED_TIMER_NUM_2
+		default 3 if LED_TIMER_NUM_3
 endmenu
